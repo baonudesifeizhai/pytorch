@@ -344,6 +344,23 @@ def user_defined_triton_kernel_transitive_closure_source_code(
             if inst.opname == "LOAD_GLOBAL"
         )
         global_annotations = cur_kernel.fn.__globals__.get("__annotations__", {})
+
+        def write_global_assignment(symbol_name: str, symbol_str: str) -> None:
+            compile_wrapper.newline()
+            if annotation := global_annotations.get(symbol_name):
+                if isinstance(annotation, type):
+                    annotation_code = (
+                        f": {annotation.__module__}.{annotation.__name__}"
+                    )
+                else:
+                    annotation_code = f": {annotation!r}"
+                compile_wrapper.writeline(
+                    f"{symbol_name}{annotation_code} = {symbol_str}"
+                )
+            else:
+                compile_wrapper.writeline(f"{symbol_name} = {symbol_str}")
+            symbols_included.add(symbol_name)
+
         for symbol_name in cur_kernel.fn.__code__.co_names:
             if symbol_name in symbols_included:
                 continue
@@ -366,24 +383,13 @@ def user_defined_triton_kernel_transitive_closure_source_code(
                     symbols_included.add(symbol_name)
                     traverse(symbol)
                 elif isinstance(symbol, (int, str, bool, constexpr)):
-                    compile_wrapper.newline()
                     if isinstance(symbol, constexpr):
                         symbol_str = f"tl.constexpr({symbol.value!r})"
                     else:
                         symbol_str = f"{symbol!r}"
-                    if annotation := global_annotations.get(symbol_name):
-                        if isinstance(annotation, type):
-                            annotation_code = (
-                                f": {annotation.__module__}.{annotation.__name__}"
-                            )
-                        else:
-                            annotation_code = f": {annotation!r}"
-                        compile_wrapper.writeline(
-                            f"{symbol_name}{annotation_code} = {symbol_str}"
-                        )
-                    else:
-                        compile_wrapper.writeline(f"{symbol_name} = {symbol_str}")
-                    symbols_included.add(symbol_name)
+                    write_global_assignment(symbol_name, symbol_str)
+                elif isinstance(symbol, triton.language.dtype):
+                    write_global_assignment(symbol_name, f"{symbol!r}")
                 elif (
                     symbol_name in unqualified_loads
                     and symbol_name != "tl"  # already imported

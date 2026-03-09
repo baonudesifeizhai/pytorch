@@ -1567,6 +1567,41 @@ def forward(self, x_1, output_1):
         self.assertIn("@triton.constexpr_function", triton_code)
         self.assertEqual(compiled_out, eager_out)
 
+    @unittest.skipIf(
+        not HAS_GPU or not hasattr(triton, "constexpr_function"),
+        "newer triton version required",
+    )
+    def test_triton_kernel_with_transitive_dtype_global(self):
+        get_int_dtype = triton.constexpr_function(tl.core.get_int_dtype)
+
+        @triton.jit
+        def helper(x):
+            idtype = get_int_dtype(
+                bitwidth=x.dtype.primitive_bitwidth,
+                signed=True,
+            )
+            return x.to(idtype, bitcast=True)
+
+        @triton.jit
+        def kernel(out_ptr, n_elements: tl.constexpr):
+            offsets = tl.arange(0, n_elements)
+            x = tl.full([n_elements], 1.0, dtype=tl.float32)
+            y = helper(x)
+            tl.store(out_ptr + offsets, y.to(tl.float32, bitcast=True))
+
+        def f():
+            out = torch.empty(8, device=GPU_TYPE)
+            kernel[(1,)](out, 8)
+            return out
+
+        eager_out = f()
+        compiled_out, (triton_code,) = run_and_get_code(
+            torch.compile(f, fullgraph=True)
+        )
+
+        self.assertIn("@triton.constexpr_function", triton_code)
+        self.assertEqual(compiled_out, eager_out)
+
     @requires_gpu
     def test_triton_kernel_with_imported_symbol_with_custom_name(self):
         @triton.jit
