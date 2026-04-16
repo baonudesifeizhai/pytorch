@@ -21,6 +21,7 @@ from torch._inductor.utils import (
 from torch.distributed._functional_collectives import (
     all_gather_tensor,
     reduce_scatter_tensor,
+    wait_tensor,
 )
 from torch.distributed._symmetric_memory import (
     _fused_all_gather_matmul_fallback,
@@ -1255,8 +1256,10 @@ class SymmMemCollectiveTest(MultiProcContinuousTest):
             inp, reduce_op, scatter_dim, group_name, out
         )
 
-        expected = reduce_scatter_tensor(inp.clone(), reduce_op, scatter_dim, group_name)
-        expected = funcol.wait_tensor(expected)
+        expected = reduce_scatter_tensor(
+            inp.clone(), reduce_op, scatter_dim, group_name
+        )
+        expected = wait_tensor(expected)
         torch.testing.assert_close(out, expected, rtol=1e-2, atol=1e-2)
 
     def _verify_reduce_scatter_result(self, inp, res):
