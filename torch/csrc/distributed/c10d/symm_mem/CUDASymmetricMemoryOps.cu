@@ -98,6 +98,22 @@ size_t get_and_verify_alignment(const at::Tensor& input, const char* op_name) {
   return std::min(ptr_alignment, size_alignment);
 }
 
+c10d::ReduceOp::RedOpType parse_sum_or_avg_reduce_op(
+    const std::string& reduce_op,
+    const char* op_name) {
+  if (reduce_op == "sum") {
+    return c10d::ReduceOp::SUM;
+  }
+  if (reduce_op == "avg") {
+    return c10d::ReduceOp::AVG;
+  }
+  TORCH_CHECK(
+      false,
+      op_name,
+      ": reduce_op must be sum or avg, got ",
+      reduce_op);
+}
+
 void init_elementwise_launch_config(
     size_t numel,
     size_t element_size,
@@ -1083,9 +1099,8 @@ at::Tensor reduce_scatter_tensor_out(
     int64_t scatter_dim,
     std::string group_name,
     at::Tensor output) {
-  TORCH_CHECK(
-      reduce_op == "sum" || reduce_op == "avg",
-      "reduce_scatter_tensor_out: reduce_op must be sum or avg");
+  const auto reduce_op_type =
+      parse_sum_or_avg_reduce_op(reduce_op, "reduce_scatter_tensor_out");
   TORCH_CHECK(
       input.dim() > 0, "reduce_scatter_tensor_out: input must have at least 1 dim.");
 
@@ -1129,7 +1144,7 @@ at::Tensor reduce_scatter_tensor_out(
         "reduce_scatter_tensor_out: only scatter_dim == 0 or the last dim is supported.");
   }
 
-  if (reduce_op == "avg" && output.numel() > 0) {
+  if (reduce_op_type == c10d::ReduceOp::AVG && output.numel() > 0) {
     ret.div_(c10d::resolve_process_group(group_name)->getSize());
   }
   return ret;
