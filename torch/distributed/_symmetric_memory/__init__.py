@@ -1367,12 +1367,13 @@ def _fused_scaled_matmul_reduce_scatter(
             out_dtype,
             use_fast_accum,
         )
-    if _should_use_fused_scaled_matmul_reduce_scatter_native(
+    backend = _select_fused_scaled_matmul_reduce_scatter_backend(
         A,
         orig_scatter_dim,
         scatter_dim_after_maybe_reshape,
         group_name,
-    ):
+    )
+    if backend == "native":
         return _fused_scaled_matmul_reduce_scatter_native(
             torch.ops.aten._scaled_mm.out,
             A,
@@ -1390,6 +1391,22 @@ def _fused_scaled_matmul_reduce_scatter(
                 "use_fast_accum": use_fast_accum,
             },
             out_dtype,
+        )
+    if backend == "fallback":
+        return _fused_scaled_matmul_reduce_scatter_fallback(
+            A,
+            B,
+            A_scale,
+            B_scale,
+            reduce_op,
+            orig_scatter_dim,
+            scatter_dim_after_maybe_reshape,
+            group_name,
+            output_shape,
+            bias,
+            result_scale,
+            out_dtype,
+            use_fast_accum,
         )
     with torch.profiler.record_function("fused_scaled_matmul_reduce_scatter"):
         return _fused_scaled_matmul_reduce_scatter_impl(
@@ -1464,25 +1481,31 @@ def _fused_scaled_matmul_reduce_scatter_fallback(
     return res
 
 
-def _should_use_fused_scaled_matmul_reduce_scatter_native(
+def _select_fused_scaled_matmul_reduce_scatter_backend(
     A: torch.Tensor,
     orig_scatter_dim: int,
     scatter_dim_after_maybe_reshape: int,
     group_name: c10d.GroupName,
-) -> bool:
+) -> Literal["native", "fallback", "pipeline"]:
     group = c10d._resolve_process_group(group_name)
     local_M = math.prod(A.shape[:-1])
 
-    return (
+    if not (
         A.is_contiguous()
         and orig_scatter_dim == 0
         and scatter_dim_after_maybe_reshape == 0
         and local_M % group.size() == 0
-        # Native RS+scaled_mm helps the latency-sensitive small-M regime, but
-        # starts to lose once M gets large enough that the default pipeline
-        # amortizes its orchestration overhead.
-        and local_M <= 1024
-    )
+    ):
+        return "pipeline"
+
+    # The crossover is empirical: native wins for small M, the plain
+    # scaled_mm + reduce_scatter fallback is best in a narrow midrange, and
+    # the pipelined fused path catches up again once M is large enough.
+    if local_M <= 2048:
+        return "native"
+    if local_M <= 4096:
+        return "fallback"
+    return "pipeline"
 
 
 def _fused_scaled_matmul_reduce_scatter_native(
