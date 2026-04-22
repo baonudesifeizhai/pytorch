@@ -35,7 +35,7 @@ import torch.fx
 import torch.nn
 from torch._dispatch.python import enable_python_dispatcher
 from torch._dynamo.utils import get_fake_value
-from torch._dynamo.variables.constant import CONSTANT_VARIABLE_NONE, ConstantVariable
+from torch._dynamo.variables.constant import ConstantVariable
 from torch._dynamo.variables.ctx_manager import RepararametrizeModuleContextVariable
 from torch._dynamo.variables.functions import UserFunctionVariable
 from torch._dynamo.variables.nn_module import UnspecializedNNModuleVariable
@@ -572,6 +572,24 @@ class StorageAliasingTracker:
         return True
 
 
+def taint_filtered_vt(vt: VariableTracker) -> None:
+    """Mark a VT as filtered due to aliasing so it raises a clear error if used."""
+    original_as_proxy = vt.as_proxy
+
+    def tainted_as_proxy() -> Any:
+        proxy = original_as_proxy()
+        raise RuntimeError(
+            f"An intermediate tensor '{proxy.node.name}' created inside a "
+            f"higher-order op subgraph aliases an input or output, so it was "
+            f"not included in the subgraph outputs. However, it is being used "
+            f"in the outer graph (e.g., via a side effect like list.append). "
+            f"To fix this, clone the tensor before capturing it "
+            f"(e.g., use tensor.clone() instead of tensor)."
+        )
+
+    vt.as_proxy = tainted_as_proxy  # type: ignore[method-assign]
+
+
 def collect_intermediate_outputs(
     tx: "InstructionTranslator",
     subtracer: "SubgraphTracer",
@@ -604,12 +622,11 @@ def collect_intermediate_outputs(
         else:
             # Filter out intermediates that alias with inputs or outputs.
             # This is needed for HOPs like invoke_subgraph that don't support aliasing.
-            # TODO: If a filtered intermediate is captured by side effects (e.g., appended
-            # to a list), it will fail later with "does not belong to this Graph" error
-            # when the outer graph tries to use it. See test_side_effect_with_aliased_intermediate.
             assert tracker is not None
             if tracker.check_and_track(proxy.node):
                 extra_outputs.append(out)
+            else:
+                taint_filtered_vt(out)
 
     return extra_outputs
 
@@ -1842,7 +1859,7 @@ def speculate_subgraph_with_auto_output_flattening(
             f"fall back to eager-mode PyTorch, which could lead to a slowdown."
         )
         log.info(msg)
-        log.info(ex)  # noqa: G200
+        log.info(ex)
         raise ex
 
 
@@ -2042,7 +2059,7 @@ def speculate_subgraph(
             f"fall back to eager-mode PyTorch, which could lead to a slowdown."
         )
         log.info(msg)
-        log.info(ex)  # noqa: G200
+        log.info(ex)
         raise ex
 
 
@@ -2495,7 +2512,7 @@ class CallTorchbindHigherOrderVariable(TorchHigherOrderOperatorVariable):
 def validate_subgraph_output_types(
     output: VariableTracker | Sequence[VariableTracker],
 ) -> None:
-    """Verify that that the output of the subgraph is a tensor,
+    """Verify that the output of the subgraph is a tensor,
     int, bool, SymBool, or SymInt.
     """
     from . import TensorVariable
@@ -4524,6 +4541,9 @@ class AutogradFunctionApplyVariable(VariableTracker):
         self.bwd_fn = bwd_fn
         self.parent_source = parent_source
 
+    def python_type(self) -> type:
+        return types.BuiltinMethodType
+
     def call_function(
         self,
         tx: "InstructionTranslator",
@@ -4762,6 +4782,7 @@ class AutogradFunctionApplyVariable(VariableTracker):
                 enable_grad=None,
                 set_subgraph_inputs="automatic",
                 allow_side_effects=True,
+                filter_aliased_intermediates=True,
                 tracer=fwd_tracer,
             )
         )
@@ -4833,7 +4854,7 @@ class AutogradFunctionApplyVariable(VariableTracker):
                 if i.is_tensor():
                     bwd_args.append(i)
                 else:
-                    bwd_args.append(CONSTANT_VARIABLE_NONE)
+                    bwd_args.append(ConstantVariable.create(None))
 
         bwd_fn, bwd_args = self.prepare_fn_vt(tx, ctx, "backward", bwd_args)
 
@@ -5665,7 +5686,7 @@ class LocalMapWrappedHigherOrderVariable(WrapHigherOrderVariable):
         return out
 
 
-from .invoke_subgraph import InvokeSubgraphHigherOrderVariable  # noqa: E402
+from .invoke_subgraph import InvokeSubgraphHigherOrderVariable
 
 
 # Map operator names to their corresponding variable for fast TorchHigherOrderOperatorVariable.make()

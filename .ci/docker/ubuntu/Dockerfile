@@ -69,12 +69,6 @@ ENV NCCL_LIB_DIR="/usr/local/cuda/lib64/"
 
 ARG CUDA_VERSION
 
-COPY ./common/install_openssl.sh install_openssl.sh
-RUN bash ./install_openssl.sh
-ENV OPENSSL_ROOT_DIR /opt/openssl
-ENV OPENSSL_DIR /opt/openssl
-RUN rm install_openssl.sh
-
 ARG INDUCTOR_BENCHMARKS
 COPY ./common/install_inductor_benchmark_deps.sh install_inductor_benchmark_deps.sh
 COPY ./common/common_utils.sh common_utils.sh
@@ -148,6 +142,17 @@ ARG ONNX
 COPY ./common/install_onnx.sh ./common/common_utils.sh ./
 RUN if [ -n "${ONNX}" ]; then bash ./install_onnx.sh; fi
 RUN rm install_onnx.sh common_utils.sh
+
+# Build TSan-instrumented CPython for thread sanitizer testing
+ARG TSAN
+COPY ./common/install_cpython.sh install_cpython.sh
+COPY requirements-ci.txt /tmp/requirements-ci.txt
+RUN if [ -n "${TSAN}" ]; then \
+      CC=clang-18 CXX=clang++-18 \
+      CPYTHON_VERSIONS="3.14.4t+tsan" bash ./install_cpython.sh && \
+      /opt/python/cp314-cp314t+tsan/bin/pip install -r /tmp/requirements-ci.txt; \
+    fi
+RUN rm -f install_cpython.sh /tmp/requirements-ci.txt
 
 # (optional) Build ACL
 ARG ACL

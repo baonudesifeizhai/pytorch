@@ -1,5 +1,4 @@
 # Owner(s): ["module: dynamo"]
-# flake8: noqa: B950
 import copy
 import math
 from dataclasses import dataclass
@@ -844,7 +843,7 @@ class GraphModule(torch.nn.Module):
             def backward(ctx, gO):
                 return torch.tensor(float("nan")).expand(10, 10)
 
-        def run_fn(a):  # noqa: F841
+        def run_fn(a):
             out = MyFunc2.apply(a)
             return out.sum()
 
@@ -1668,7 +1667,7 @@ class GraphModule(torch.nn.Module):
             mask = block_start < n_elements
             grad_out = tl.load(grad_out_ptr + block_start, mask=mask)
             # Read offsets (read-only, not written back)
-            _offsets_val = tl.load(offsets_ptr + 0)  # noqa: F841
+            _offsets_val = tl.load(offsets_ptr + 0)
             tl.store(grad_x_ptr + block_start, grad_out, mask=mask)
 
         class FnWithReadOnlyBwdInput(torch.autograd.Function):
@@ -2132,6 +2131,79 @@ class GraphModule(torch.nn.Module):
         opt_fn = torch.compile(fn, fullgraph=True, backend=backend)
         res = opt_fn(input_data, x)
         self.assertEqual(ref, res)
+
+    def test_inplace_op_with_side_effect_wrong_grad(self):
+        # Repro for https://github.com/pytorch/pytorch/issues/180642
+        # In-place op inside autograd.Function.forward combined with a side
+        # effect (list append) causes collect_intermediate_outputs to add a
+        # pre-mutation alias as an extra subgraph output. Because the alias
+        # shares the same TensorImpl as the real return value,
+        # set_gradient_edge overwrites output_nr, routing the backward
+        # gradient to the wrong slot and producing zero gradients.
+        captured = []
+
+        class Foo(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, x):
+                intermediate = torch.sin(x)
+                captured.append(intermediate)
+                loss = torch.tensor(0.0, device=x.device)
+                loss += x.sum()
+                return loss
+
+            @staticmethod
+            def backward(ctx, grad):
+                return grad.expand(8)
+
+        def fn(x):
+            return Foo.apply(x)
+
+        x = torch.randn(8, device="cpu", requires_grad=True)
+
+        # Eager reference
+        x_ref = x.detach().clone().requires_grad_(True)
+        captured.clear()
+        out_ref = fn(x_ref)
+        out_ref.backward()
+
+        # Compiled
+        torch._dynamo.reset()
+        captured.clear()
+        x_c = x.detach().clone().requires_grad_(True)
+        out_c = torch.compile(fn, backend="eager", fullgraph=True)(x_c)
+        out_c.backward()
+
+        self.assertEqual(x_ref.grad, x_c.grad)
+
+    def test_aliased_intermediate_captured_by_side_effect(self):
+        # An intermediate that aliases an input is captured via side effect
+        # and used by the outer graph. filter_aliased_intermediates drops it
+        # from the subgraph outputs, but the outer graph still needs it.
+        # We should get a clear error telling the user to clone.
+        captured = []
+
+        class Bar(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, x):
+                view = x.view(-1)
+                captured.append(view)
+                return x.sum()
+
+            @staticmethod
+            def backward(ctx, grad):
+                return grad.expand(8)
+
+        def fn(x):
+            out = Bar.apply(x)
+            return out + captured[0].sum()
+
+        x = torch.randn(8, requires_grad=True)
+        captured.clear()
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "aliases an input or output.*clone",
+        ):
+            torch.compile(fn, backend="eager", fullgraph=True)(x)
 
 
 class AutogradFunctionFunctorchTests(torch._dynamo.test_case.TestCase):
