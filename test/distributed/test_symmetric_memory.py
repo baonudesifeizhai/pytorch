@@ -18,11 +18,7 @@ from torch._inductor.utils import (
     fresh_inductor_cache,
     run_and_get_triton_code,
 )
-from torch.distributed._functional_collectives import (
-    all_gather_tensor,
-    reduce_scatter_tensor,
-    wait_tensor,
-)
+from torch.distributed._functional_collectives import all_gather_tensor
 from torch.distributed._symmetric_memory import (
     _fused_all_gather_matmul_fallback,
     _fused_all_gather_scaled_matmul_fallback,
@@ -1256,21 +1252,24 @@ class SymmMemCollectiveTest(MultiProcContinuousTest):
             inp, reduce_op, scatter_dim, group_name, out
         )
 
-        expected = reduce_scatter_tensor(
-            inp.clone(), reduce_op, scatter_dim, group_name
+        self._verify_reduce_scatter_result(
+            inp, out, scatter_dim=scatter_dim, reduce_op=reduce_op
         )
-        expected = wait_tensor(expected)
-        torch.testing.assert_close(out, expected, rtol=1e-2, atol=1e-2)
 
-    def _verify_reduce_scatter_result(self, inp, res):
+    def _verify_reduce_scatter_result(
+        self, inp, res, *, scatter_dim: int = -1, reduce_op: str = "sum"
+    ):
         gathered_res = all_gather_tensor(res, 0, "0").view(self.world_size, *res.shape)
         gathered_inps = all_gather_tensor(inp, 0, "0").view(self.world_size, *inp.shape)
-        sum_inps = gathered_inps.sum(0)
-        slice_width = sum_inps.shape[-1] // self.world_size
+        expected = gathered_inps.sum(0)
+        if reduce_op == "avg":
+            expected.div_(self.world_size)
+        scatter_dim = scatter_dim if scatter_dim >= 0 else scatter_dim + inp.dim()
+        slice_width = expected.shape[scatter_dim] // self.world_size
         for i in range(self.world_size):
             torch.testing.assert_close(
                 gathered_res[i],
-                sum_inps[..., i * slice_width : (i + 1) * slice_width],
+                expected.narrow(scatter_dim, i * slice_width, slice_width),
                 rtol=1e-01,
                 atol=1.1e-01,
             )
