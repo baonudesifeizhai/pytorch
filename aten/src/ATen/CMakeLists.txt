@@ -411,6 +411,7 @@ IF(USE_MSLK)
 
     file(GLOB_RECURSE mslk_native_cuda_cpp CONFIGURE_DEPENDS
       "${MSLK_SRCS}/common/*.cpp"
+      "${MSLK_SRCS}/pytorch_*.cpp"
     )
 
     # Combine all source files into a single list

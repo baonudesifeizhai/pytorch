@@ -1076,6 +1076,362 @@ at::Tensor reduce_scatter_out(
   }
   return output;
 }
+
+template <typename T, int k_world_size>
+__global__ void tile_reduce_scatter_kernel(
+    void** partial_ptrs,
+    void** signal_ptrs,
+    T* output,
+    size_t partials_byte_offset,
+    size_t signals_u32_offset,
+    int64_t output_rows,
+    int64_t ncols,
+    int64_t chunk_m,
+    int64_t total_m,
+    int64_t tile_m,
+    int64_t tile_n,
+    uint32_t epoch,
+    int rank) {
+  const int64_t tile_col = static_cast<int64_t>(blockIdx.x);
+  const int64_t tile_row = static_cast<int64_t>(blockIdx.y);
+  const int64_t local_row_start = tile_row * tile_m;
+  const int64_t local_row_end =
+      (local_row_start + tile_m) < output_rows ? (local_row_start + tile_m)
+                                               : output_rows;
+  const int64_t col_start = tile_col * tile_n;
+  const int64_t col_end =
+      (col_start + tile_n) < ncols ? (col_start + tile_n) : ncols;
+  const int64_t global_row_start = static_cast<int64_t>(rank) * chunk_m + local_row_start;
+  const int64_t global_row_end =
+      (static_cast<int64_t>(rank) * chunk_m + local_row_end) < total_m
+      ? (static_cast<int64_t>(rank) * chunk_m + local_row_end)
+      : total_m;
+  const int64_t global_tile_start = global_row_start / tile_m;
+  const int64_t global_tile_end = (global_row_end + tile_m - 1) / tile_m;
+  const int64_t num_tiles_n = (ncols + tile_n - 1) / tile_n;
+
+  for (int peer = 0; peer < k_world_size; ++peer) {
+    auto* peer_signals =
+        reinterpret_cast<uint32_t*>(signal_ptrs[peer]) + signals_u32_offset;
+    for (int64_t global_tile_m = global_tile_start;
+         global_tile_m < global_tile_end;
+         ++global_tile_m) {
+      const int64_t tile_idx = global_tile_m * num_tiles_n + tile_col;
+      while (true) {
+#if !defined(USE_ROCM) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 600)
+        ::cuda::atomic_ref<uint32_t, ::cuda::thread_scope_system> ref(
+            peer_signals[tile_idx]);
+        if (ref.load(::cuda::std::memory_order_acquire) >= epoch) {
+          break;
+        }
+#else
+        if (peer_signals[tile_idx] >= epoch) {
+          break;
+        }
+#endif
+        __nanosleep(40);
+      }
+    }
+  }
+
+  const int64_t rows = local_row_end - local_row_start;
+  const int64_t cols = col_end - col_start;
+  const int64_t tile_numel = rows * cols;
+  for (int64_t linear = blockDim.x * blockIdx.z + threadIdx.x;
+       linear < tile_numel;
+       linear += static_cast<int64_t>(blockDim.x) * gridDim.z) {
+    const int64_t local_r = linear / cols;
+    const int64_t c = linear - local_r * cols;
+    const int64_t out_row = local_row_start + local_r;
+    const int64_t global_row = static_cast<int64_t>(rank) * chunk_m + out_row;
+    const int64_t col = col_start + c;
+
+    float accum = 0.0f;
+    for (int peer = 0; peer < k_world_size; ++peer) {
+      auto* peer_partials = reinterpret_cast<T*>(
+          reinterpret_cast<uint8_t*>(partial_ptrs[peer]) + partials_byte_offset);
+      accum += static_cast<float>(peer_partials[global_row * ncols + col]);
+    }
+    output[out_row * ncols + col] = static_cast<T>(accum);
+  }
+}
+
+template <int k_world_size>
+__global__ void mark_tile_signals_kernel(
+    uint32_t* tile_signals,
+    int64_t count,
+    uint32_t epoch) {
+  for (int64_t idx = blockDim.x * blockIdx.x + threadIdx.x;
+       idx < count;
+       idx += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+#if !defined(USE_ROCM)
+    __threadfence_system();
+#endif
+#if !defined(USE_ROCM) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 600)
+    ::cuda::atomic_ref<uint32_t, ::cuda::thread_scope_system> ref(
+        tile_signals[idx]);
+    ref.store(epoch, ::cuda::std::memory_order_release);
+#else
+    tile_signals[idx] = epoch;
+#endif
+  }
+}
+
+at::Tensor mark_tile_signals_(at::Tensor tile_signals, int64_t epoch) {
+  TORCH_CHECK(
+      tile_signals.dim() == 1 && tile_signals.is_contiguous() &&
+          tile_signals.scalar_type() == c10::ScalarType::UInt32,
+      "mark_tile_signals_: tile_signals must be a flat, contiguous uint32 tensor.");
+  TORCH_CHECK(epoch > 0, "mark_tile_signals_: epoch must be positive.");
+  TORCH_CHECK(
+      static_cast<uint64_t>(epoch) <= std::numeric_limits<uint32_t>::max(),
+      "mark_tile_signals_: epoch exceeds uint32 range.");
+
+  if (tile_signals.numel() == 0) {
+    return tile_signals;
+  }
+  c10::cuda::CUDAGuard guard(tile_signals.device());
+  const int threads = 256;
+  const int64_t blocks_needed = (tile_signals.numel() + threads - 1) / threads;
+  const int blocks = static_cast<int>(blocks_needed < 1024 ? blocks_needed : 1024);
+  mark_tile_signals_kernel<1>
+      <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+          reinterpret_cast<uint32_t*>(tile_signals.data_ptr()),
+          tile_signals.numel(),
+          static_cast<uint32_t>(epoch));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return tile_signals;
+}
+
+at::Tensor tile_reduce_scatter_out(
+    at::Tensor partials,
+    at::Tensor tile_signals,
+    int64_t epoch,
+    std::string group_name,
+    int64_t tile_m,
+    int64_t tile_n,
+    int64_t total_m,
+    at::Tensor output) {
+  TORCH_CHECK(
+      partials.dim() == 2 && partials.is_contiguous(),
+      "tile_reduce_scatter_out: partials must be a contiguous 2D tensor.");
+  TORCH_CHECK(
+      output.dim() == 2 && output.is_contiguous(),
+      "tile_reduce_scatter_out: output must be a contiguous 2D tensor.");
+  TORCH_CHECK(
+      partials.scalar_type() == output.scalar_type(),
+      "tile_reduce_scatter_out: partials and output must have the same dtype.");
+  TORCH_CHECK(
+      partials.scalar_type() == at::kBFloat16 || partials.scalar_type() == at::kFloat,
+      "tile_reduce_scatter_out: only bfloat16 and float are supported.");
+  TORCH_CHECK(
+      tile_signals.dim() == 1 && tile_signals.is_contiguous() &&
+          tile_signals.scalar_type() == c10::ScalarType::UInt32,
+      "tile_reduce_scatter_out: tile_signals must be a flat, contiguous uint32 tensor.");
+  TORCH_CHECK(epoch > 0, "tile_reduce_scatter_out: epoch must be positive.");
+  TORCH_CHECK(tile_m > 0 && tile_n > 0, "tile_reduce_scatter_out: tile sizes must be positive.");
+  TORCH_CHECK(total_m >= 0, "tile_reduce_scatter_out: total_m must be non-negative.");
+  TORCH_CHECK(
+      partials.size(0) >= total_m,
+      "tile_reduce_scatter_out: partials rows must cover total_m.");
+  TORCH_CHECK(
+      output.size(1) == partials.size(1),
+      "tile_reduce_scatter_out: output and partials must have the same N dimension.");
+
+  auto partials_symm_mem = c10d::symmetric_memory::rendezvous(partials, group_name);
+  TORCH_CHECK(
+      partials_symm_mem != nullptr,
+      "tile_reduce_scatter_out: partials must be allocated with empty_strided_p2p().");
+  auto signals_symm_mem = c10d::symmetric_memory::rendezvous(tile_signals, group_name);
+  TORCH_CHECK(
+      signals_symm_mem != nullptr,
+      "tile_reduce_scatter_out: tile_signals must be allocated with empty_strided_p2p().");
+  TORCH_CHECK(
+      partials_symm_mem->get_world_size() == signals_symm_mem->get_world_size(),
+      "tile_reduce_scatter_out: partials and tile_signals must use the same group.");
+  TORCH_CHECK(
+      partials_symm_mem->get_rank() == signals_symm_mem->get_rank(),
+      "tile_reduce_scatter_out: partials and tile_signals rank mismatch.");
+
+  const int world_size = partials_symm_mem->get_world_size();
+  const int rank = partials_symm_mem->get_rank();
+  const int64_t chunk_m = at::ceil_div(total_m, static_cast<int64_t>(world_size));
+  const int64_t local_start = static_cast<int64_t>(rank) * chunk_m;
+  const int64_t expected_rows =
+      local_start >= total_m ? 0 : std::min(chunk_m, total_m - local_start);
+  TORCH_CHECK(
+      output.size(0) == expected_rows,
+      "tile_reduce_scatter_out: output rows must equal this rank's ceil-div row shard.");
+  const int64_t ncols = partials.size(1);
+  const int64_t num_tiles_m = at::ceil_div(total_m, tile_m);
+  const int64_t num_tiles_n = at::ceil_div(ncols, tile_n);
+  TORCH_CHECK(
+      tile_signals.numel() >= num_tiles_m * num_tiles_n,
+      "tile_reduce_scatter_out: tile_signals is too small.");
+
+  if (output.numel() == 0) {
+    return output;
+  }
+
+  c10::cuda::CUDAGuard guard(partials.device());
+  const int threads = 256;
+  const int tile_blocks_z = 1;
+  const dim3 grid(num_tiles_n, at::ceil_div(output.size(0), tile_m), tile_blocks_z);
+  const size_t partials_byte_offset =
+      partials_symm_mem->get_offset() +
+      static_cast<size_t>(partials.storage_offset()) * partials.element_size();
+  const size_t signals_u32_offset =
+      signals_symm_mem->get_offset() / sizeof(uint32_t) +
+      static_cast<size_t>(tile_signals.storage_offset());
+
+  AT_DISPATCH_FLOAT_AND_BFLOAT16(
+      partials.scalar_type(), "tile_reduce_scatter_out", [&]() {
+        DISPATCH_WORLD_SIZES_NO_DEFAULT(world_size, [&]() {
+          tile_reduce_scatter_kernel<scalar_t, k_world_size>
+              <<<grid, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+                  partials_symm_mem->get_buffer_ptrs_dev(),
+                  signals_symm_mem->get_buffer_ptrs_dev(),
+                  output.data_ptr<scalar_t>(),
+                  partials_byte_offset,
+                  signals_u32_offset,
+                  output.size(0),
+                  ncols,
+                  chunk_m,
+                  total_m,
+                  tile_m,
+                  tile_n,
+                  static_cast<uint32_t>(epoch),
+                  rank);
+          C10_CUDA_KERNEL_LAUNCH_CHECK();
+        });
+      });
+  return output;
+}
+
+__device__ __forceinline__ int64_t nvfp4_swizzled_scale_offset(
+    int64_t row,
+    int64_t col,
+    int64_t scale_cols) {
+  const int64_t col_tiles = scale_cols / 4;
+  const int64_t tile_row = row / 128;
+  const int64_t tile_col = col / 4;
+  const int64_t row_in_tile = row % 128;
+  return 512 * (tile_row * col_tiles + tile_col) +
+      (row_in_tile % 32) * 16 + (row_in_tile / 32) * 4 + (col % 4);
+}
+
+__global__ void nvfp4_repack_swizzled_scale_kernel(
+    const uint8_t* global_scale,
+    const int64_t* m_sizes,
+    const int64_t* row_starts,
+    uint8_t* output,
+    int64_t num_groups,
+    int64_t scale_cols,
+    int64_t output_rows) {
+  const int64_t numel = output_rows * scale_cols;
+  for (int64_t linear_idx = blockIdx.x * blockDim.x + threadIdx.x;
+       linear_idx < numel;
+       linear_idx += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    const int64_t out_row = linear_idx / scale_cols;
+    const int64_t col = linear_idx - out_row * scale_cols;
+
+    int64_t group = 0;
+    int64_t group_row_start = 0;
+    int64_t next_group_row_start = 0;
+    int64_t group_m = 0;
+    for (; group < num_groups; ++group) {
+      group_row_start = next_group_row_start;
+      group_m = m_sizes[group];
+      const int64_t padded_m = ((group_m + 127) / 128) * 128;
+      next_group_row_start += padded_m;
+      if (out_row < next_group_row_start) {
+        break;
+      }
+    }
+
+    if (group >= num_groups) {
+      return;
+    }
+
+    uint8_t value = 0;
+    const int64_t local_row = out_row - group_row_start;
+    if (local_row < group_m) {
+      const int64_t global_row = row_starts[group] + local_row;
+      const int64_t src_offset =
+          nvfp4_swizzled_scale_offset(global_row, col, scale_cols);
+      value = global_scale[src_offset];
+    }
+
+    const int64_t dst_offset = group_row_start * scale_cols +
+        nvfp4_swizzled_scale_offset(local_row, col, scale_cols);
+    output[dst_offset] = value;
+  }
+}
+
+at::Tensor nvfp4_repack_swizzled_scale_out(
+    at::Tensor global_scale,
+    at::Tensor m_sizes,
+    at::Tensor row_starts,
+    at::Tensor output) {
+  TORCH_CHECK(
+      global_scale.dim() == 2 && global_scale.is_contiguous(),
+      "nvfp4_repack_swizzled_scale_out: global_scale must be a contiguous 2D tensor.");
+  TORCH_CHECK(
+      output.dim() == 2 && output.is_contiguous(),
+      "nvfp4_repack_swizzled_scale_out: output must be a contiguous 2D tensor.");
+  TORCH_CHECK(
+      global_scale.scalar_type() == output.scalar_type(),
+      "nvfp4_repack_swizzled_scale_out: global_scale and output must have the same dtype.");
+  TORCH_CHECK(
+      global_scale.element_size() == 1,
+      "nvfp4_repack_swizzled_scale_out: scale dtype must be one byte per element.");
+  TORCH_CHECK(
+      output.size(1) == global_scale.size(1),
+      "nvfp4_repack_swizzled_scale_out: output and global_scale must have the same scale column count.");
+  TORCH_CHECK(
+      global_scale.size(1) % 4 == 0,
+      "nvfp4_repack_swizzled_scale_out: scale column count must be padded to a multiple of 4.");
+  TORCH_CHECK(
+      m_sizes.dim() == 1 && m_sizes.is_contiguous() &&
+          m_sizes.scalar_type() == at::kLong,
+      "nvfp4_repack_swizzled_scale_out: m_sizes must be a contiguous int64 tensor.");
+  TORCH_CHECK(
+      row_starts.dim() == 1 && row_starts.is_contiguous() &&
+          row_starts.scalar_type() == at::kLong,
+      "nvfp4_repack_swizzled_scale_out: row_starts must be a contiguous int64 tensor.");
+  TORCH_CHECK(
+      row_starts.numel() >= m_sizes.numel(),
+      "nvfp4_repack_swizzled_scale_out: row_starts must contain at least one entry per group.");
+  TORCH_CHECK(
+      global_scale.device() == output.device() &&
+          global_scale.device() == m_sizes.device() &&
+          global_scale.device() == row_starts.device(),
+      "nvfp4_repack_swizzled_scale_out: all tensors must be on the same CUDA device.");
+
+  if (output.numel() == 0) {
+    return output;
+  }
+
+  c10::cuda::CUDAGuard guard(output.device());
+  const int threads = 256;
+  const int64_t blocks_needed = (output.numel() + threads - 1) / threads;
+  const int blocks =
+      static_cast<int>(blocks_needed < 1024 ? blocks_needed : 1024);
+  nvfp4_repack_swizzled_scale_kernel<<<
+      blocks,
+      threads,
+      0,
+      at::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<const uint8_t*>(global_scale.data_ptr()),
+      reinterpret_cast<const int64_t*>(m_sizes.data_ptr()),
+      reinterpret_cast<const int64_t*>(row_starts.data_ptr()),
+      reinterpret_cast<uint8_t*>(output.data_ptr()),
+      m_sizes.numel(),
+      global_scale.size(1),
+      output.size(0));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return output;
+}
 } // namespace
 #elif defined(CUDART_VERSION) && CUDART_VERSION < 12030
 namespace {
@@ -1171,6 +1527,33 @@ at::Tensor reduce_scatter_out(
     bool split_last_dim,
     at::Tensor output) {
   TORCH_CHECK(false, "reduce_scatter_out: requires CUDA 12.3+.");
+  return output;
+}
+
+at::Tensor mark_tile_signals_(at::Tensor tile_signals, int64_t epoch) {
+  TORCH_CHECK(false, "mark_tile_signals_: requires CUDA 12.3+.");
+  return tile_signals;
+}
+
+at::Tensor tile_reduce_scatter_out(
+    at::Tensor partials,
+    at::Tensor tile_signals,
+    int64_t epoch,
+    std::string group_name,
+    int64_t tile_m,
+    int64_t tile_n,
+    int64_t total_m,
+    at::Tensor output) {
+  TORCH_CHECK(false, "tile_reduce_scatter_out: requires CUDA 12.3+.");
+  return output;
+}
+
+at::Tensor nvfp4_repack_swizzled_scale_out(
+    at::Tensor global_scale,
+    at::Tensor m_sizes,
+    at::Tensor row_starts,
+    at::Tensor output) {
+  TORCH_CHECK(false, "nvfp4_repack_swizzled_scale_out: requires CUDA 12.3+.");
   return output;
 }
 
@@ -1316,6 +1699,9 @@ TORCH_LIBRARY_IMPL(symm_mem, CUDA, m) {
   m.impl("two_shot_all_reduce_", ::two_shot_all_reduce_);
   m.impl("two_shot_all_reduce_out", ::two_shot_all_reduce_out);
   m.impl("reduce_scatter_out", ::reduce_scatter_out);
+  m.impl("mark_tile_signals_", ::mark_tile_signals_);
+  m.impl("tile_reduce_scatter_out", ::tile_reduce_scatter_out);
+  m.impl("nvfp4_repack_swizzled_scale_out", ::nvfp4_repack_swizzled_scale_out);
 
   m.impl("_async_input_mm", c10d::cuda::detail::async_input_mm);
 #endif

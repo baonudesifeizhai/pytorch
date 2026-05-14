@@ -470,6 +470,12 @@ lib.define(
     "bool use_fast_accum = False) -> Tensor",
     tags=[torch._C.Tag.needs_fixed_stride_order],
 )
+lib.define(
+    "fused_nvfp4_scaled_matmul_reduce_scatter("
+    "Tensor A, Tensor B, Tensor A_scale, Tensor A_global_scale, Tensor B_scale, Tensor B_global_scale, "
+    "str reduce_op, str group_name, int tile_m=128, int tile_n=256) -> Tensor",
+    tags=[torch._C.Tag.needs_fixed_stride_order],
+)
 lib.define("_low_contention_all_gather(Tensor tensor, str group_name) -> Tensor")
 lib.define(
     "_low_contention_reduce_scatter(Tensor tensor, str reduce_op, str group_name) -> Tensor"
@@ -1572,6 +1578,134 @@ def _fused_scaled_matmul_reduce_scatter_impl(
     output_shape[orig_scatter_dim] //= group.size()
     out = reduced_out.view(*output_shape)
     return out
+
+
+_nvfp4_tile_rs_epoch = 0
+
+
+def _align_up(x: int, alignment: int) -> int:
+    return ((x + alignment - 1) // alignment) * alignment
+
+
+@torch.library.impl(lib, "fused_nvfp4_scaled_matmul_reduce_scatter", "Meta")
+def _fused_nvfp4_scaled_matmul_reduce_scatter_meta(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    A_global_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    B_global_scale: torch.Tensor,
+    reduce_op: str,
+    group_name: c10d.GroupName,
+    tile_m: int = 128,
+    tile_n: int = 256,
+) -> torch.Tensor:
+    del A_scale, A_global_scale, B_scale, B_global_scale, reduce_op, tile_m, tile_n
+    group_size = c10d._get_group_size_by_name(group_name)
+    local_m = min(math.ceil(A.shape[0] / group_size), A.shape[0])
+    return A.new_empty((local_m, B.shape[-2]), dtype=torch.bfloat16)
+
+
+@torch.library.impl(lib, "fused_nvfp4_scaled_matmul_reduce_scatter", "CUDA")
+def _fused_nvfp4_scaled_matmul_reduce_scatter(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    A_global_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    B_global_scale: torch.Tensor,
+    reduce_op: str,
+    group_name: c10d.GroupName,
+    tile_m: int = 128,
+    tile_n: int = 256,
+) -> torch.Tensor:
+    if reduce_op != "sum":
+        raise ValueError("fused_nvfp4_scaled_matmul_reduce_scatter only supports sum")
+    if A.dim() != 2 or B.dim() != 2:
+        raise ValueError("A and B must be 2D tensors")
+    if tile_m <= 0 or tile_n <= 0:
+        raise ValueError("tile_m and tile_n must be positive")
+    if not hasattr(torch.ops, "mslk") or not hasattr(
+        torch.ops.mslk, "f4f4bf16_grouped_stacked_out"
+    ):
+        raise RuntimeError(
+            "torch.ops.mslk.f4f4bf16_grouped_stacked_out is unavailable; "
+            "rebuild with USE_MSLK=1 and the MSLK PyTorch registration source."
+        )
+
+    group = c10d._resolve_process_group(group_name)
+    rank = group.rank()
+    world_size = group.size()
+    total_m = A.shape[0]
+    n = B.shape[-2]
+    chunk_m = math.ceil(total_m / world_size) if total_m > 0 else 0
+    starts = [rank_idx * chunk_m for rank_idx in range(world_size + 1)]
+    sizes = [
+        min(chunk_m, max(0, total_m - rank_idx * chunk_m))
+        for rank_idx in range(world_size)
+    ]
+    local_m = sizes[rank]
+
+    partial_bytes = total_m * n * torch.tensor([], dtype=torch.bfloat16).element_size()
+    signal_offset_bytes = _align_up(partial_bytes, 16)
+    num_tiles = math.ceil(total_m / tile_m) * math.ceil(n / tile_n)
+    signal_bytes = num_tiles * torch.tensor([], dtype=torch.uint32).element_size()
+    workspace = get_symm_mem_workspace(group_name, signal_offset_bytes + signal_bytes)
+    partials = workspace.get_buffer(rank, (total_m, n), torch.bfloat16, 0)
+    tile_signals = workspace.get_buffer(
+        rank,
+        (num_tiles,),
+        torch.uint32,
+        signal_offset_bytes // torch.tensor([], dtype=torch.uint32).element_size(),
+    )
+
+    m_sizes = torch.tensor(sizes, device=A.device, dtype=torch.long)
+    start_rows = torch.tensor(starts, device=A.device, dtype=torch.long)
+    local_scale_starts = [0]
+    for size in sizes:
+        local_scale_starts.append(local_scale_starts[-1] + _align_up(size, 128))
+    local_scale_start_rows = torch.tensor(
+        local_scale_starts, device=A.device, dtype=torch.long
+    )
+    local_a_scale = A_scale.new_empty((local_scale_starts[-1], A_scale.shape[1]))
+    torch.ops.symm_mem.nvfp4_repack_swizzled_scale_out.default(
+        A_scale,
+        m_sizes,
+        start_rows,
+        local_a_scale,
+    )
+    alpha = (A_global_scale.reshape(()) * B_global_scale.reshape(())).reshape(1)
+    alpha = alpha.to(device=A.device, dtype=torch.float32).contiguous()
+
+    torch.ops.mslk.f4f4bf16_grouped_stacked_out.default(
+        A,
+        B,
+        local_a_scale,
+        B_scale,
+        m_sizes,
+        alpha,
+        local_scale_start_rows,
+        partials,
+        False,
+    )
+
+    global _nvfp4_tile_rs_epoch
+    _nvfp4_tile_rs_epoch = (_nvfp4_tile_rs_epoch % 0x7FFFFFFF) + 1
+    epoch = _nvfp4_tile_rs_epoch
+    torch.ops.symm_mem.mark_tile_signals_.default(tile_signals, epoch)
+
+    output = A.new_empty((local_m, n), dtype=torch.bfloat16)
+    torch.ops.symm_mem.tile_reduce_scatter_out.default(
+        partials,
+        tile_signals,
+        epoch,
+        group_name,
+        tile_m,
+        tile_n,
+        total_m,
+        output,
+    )
+    return output
 
 
 def restride_A_for_fused_matmul_reduce_scatter(

@@ -547,6 +547,9 @@ TORCH_LIBRARY_FRAGMENT(symm_mem, m) {
       "stream_write_value32_(Tensor(a!) input, int offset, int val) -> Tensor(a!)");
   m.def(
       "memset32_(Tensor(a!) input, int offset, int val, int count) -> Tensor(a!)");
+  m.def("mark_tile_signals_(Tensor(a!) tile_signals, int epoch) -> Tensor(a!)");
+  m.def(
+      "tile_reduce_scatter_out(Tensor partials, Tensor tile_signals, int epoch, str group_name, int tile_m, int tile_n, int total_m, Tensor(a!) output) -> Tensor(a!)");
 
   m.def("nvshmem_put(Tensor(a!) tensor, int peer) -> ()");
   m.def("nvshmem_get(Tensor(a!) tensor, int peer) -> ()");
@@ -573,6 +576,8 @@ TORCH_LIBRARY_FRAGMENT(symm_mem, m) {
       "tile_reduce(Tensor in_tile, Tensor(a!) out_tile, int root, str group_name, str reduce_op='sum') -> ()");
   m.def(
       "multi_root_tile_reduce(Tensor[] in_tiles, Tensor(a!) out_tile, int[] roots, str group_name, str reduce_op='sum') -> ()");
+  m.def(
+      "nvfp4_repack_swizzled_scale_out(Tensor global_scale, Tensor m_sizes, Tensor row_starts, Tensor(a!) output) -> Tensor(a!)");
 
   // Dispatcher-visible (TorchBind) SymmetricMemory API.
   // For now, `_rendezvous` and `_barrier` are for testing dispatcher support
